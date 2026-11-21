@@ -30,41 +30,104 @@ const REACH: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 
 const PURCHASE: u8 = 2;
-/// `Ev::kind` of a kept copy that failed validation.
-const NOT_OK: u8 = u8::MAX;
 
-/// An event copy as parsed. `ok` is the result of validation (rules 3 and 4), done
-/// up front; the copy still competes in dedup (rule 2) when it is not ok.
+/// How times and price + category are stored. Times are offsets from `window_start -
+/// 7 days`, where every valid click and event lies. A price of 0 marks a view or a cart
+/// (a purchase costs at least 1), so the price doubles as the type. `Narrow` packs an
+/// event into 16 bytes and fits windows up to 42 days and up to 256 categories, every
+/// generated dataset; `Wide` takes anything else.
+trait Rec: Copy + Send + Sync + 'static {
+    type T: Copy + Ord + Send + Sync;
+    type P: Copy + Eq + Send + Sync;
+    /// `P` of a copy that failed validation.
+    const BAD: Self::P;
+    fn t(off: i64) -> Self::T;
+    fn off(t: Self::T) -> i64;
+    fn pc(price: u32, cat: u16) -> Self::P;
+    fn price(p: Self::P) -> u32;
+    fn cat(p: Self::P) -> usize;
+}
+
+/// u32 milliseconds, and `price | cat << 24`: both come back exactly and no real value
+/// is BAD (lean/Sessions/Pack.lean, `roundtrip`).
 #[derive(Clone, Copy)]
-struct Raw {
+struct Narrow;
+impl Rec for Narrow {
+    type T = u32;
+    type P = u32;
+    const BAD: u32 = u32::MAX;
+    #[inline(always)]
+    fn t(off: i64) -> u32 {
+        off as u32
+    }
+    #[inline(always)]
+    fn off(t: u32) -> i64 {
+        t as i64
+    }
+    #[inline(always)]
+    fn pc(price: u32, cat: u16) -> u32 {
+        price | (cat as u32) << 24
+    }
+    #[inline(always)]
+    fn price(p: u32) -> u32 {
+        p & 0xff_ffff
+    }
+    #[inline(always)]
+    fn cat(p: u32) -> usize {
+        (p >> 24) as usize
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Wide;
+impl Rec for Wide {
+    type T = i64;
+    type P = (u32, u16);
+    const BAD: (u32, u16) = (u32::MAX, 0);
+    fn t(off: i64) -> i64 {
+        off
+    }
+    fn off(t: i64) -> i64 {
+        t
+    }
+    fn pc(price: u32, cat: u16) -> (u32, u16) {
+        (price, cat)
+    }
+    fn price(p: (u32, u16)) -> u32 {
+        p.0
+    }
+    fn cat(p: (u32, u16)) -> usize {
+        p.1 as usize
+    }
+}
+
+/// An event copy as parsed. `pc` is BAD unless it passed validation (rules 3 and 4),
+/// done up front; the copy still competes in dedup (rule 2) when it is not ok.
+#[derive(Clone, Copy)]
+struct Raw<R: Rec> {
     eid: u64,
     ingest: i64,
     uid: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    kind: u8,
-    ok: bool,
+    t: R::T,
+    pc: R::P,
 }
 
 /// A surviving event, keyed by its person.
 #[derive(Clone, Copy)]
-struct Ev {
+struct Ev<R: Rec> {
     person: u64,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    kind: u8,
+    t: R::T,
+    pc: R::P,
 }
 
 /// A valid click. Copies of a click are identical, so they are not deduped: an extra
 /// copy never changes which campaign credits a session (same ts, same click_id, same
 /// campaign) and a campaign assists a session once however many clicks qualify.
 #[derive(Clone, Copy)]
-struct Click {
+struct Click<R: Rec> {
     person: u64,
-    ts: i64,
     cid: u64,
+    t: R::T,
     camp: u32,
 }
 
@@ -227,21 +290,38 @@ fn people(keys: &Keys, pairs: &[(u64, u64)]) -> Table<u64> {
     t
 }
 
-struct Parse {
+struct Parse<R: Rec> {
     buf: Vec<u8>,
-    ev: Vec<Vec<Raw>>,
+    ev: Vec<Vec<Raw<R>>>,
     /// Valid clicks under their user_id; the person comes in stage 2.
-    ck: Vec<Click>,
+    ck: Vec<Click<R>>,
 }
 
 /// Stage 2, per thread: person buckets of events and of clicks, and the dedup scratch,
 /// reused across event_id buckets so its tables are not faulted in afresh each time.
-struct Dedup {
-    ev: Vec<Vec<Ev>>,
-    ck: Vec<Vec<Click>>,
+struct Dedup<R: Rec> {
+    ev: Vec<Vec<Ev<R>>>,
+    ck: Vec<Vec<Click<R>>>,
     slots: Vec<(u64, u32)>,
-    kept: Vec<Ev>,
+    kept: Vec<Ev<R>>,
     ingest: Vec<i64>,
+}
+
+/// What `run` needs from the small tables.
+struct Ctx {
+    t0: Instant,
+    data: PathBuf,
+    out: PathBuf,
+    threads: usize,
+    ws: i64,
+    we: i64,
+    first_day: i64,
+    ndays: usize,
+    cats: Vec<Vec<u8>>,
+    products: Lookup<u16>,
+    unknown: u16,
+    campaigns: Lookup<u32>,
+    crows: Vec<[Vec<u8>; 2]>,
 }
 
 fn main() {
@@ -258,7 +338,6 @@ fn main() {
         return;
     }
     let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("{:>8.3}s  {what}", t0.elapsed().as_secs_f64());
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out = PathBuf::from(env("OUTPUT_DIR", "/output"));
@@ -281,9 +360,21 @@ fn main() {
     let products: Lookup<u16> = Lookup::new(&prows.iter().map(|r| (&r[0][..], cat_of(&r[1]))).collect::<Vec<_>>());
 
     let crows = scan::rows::<2>(&std::fs::read(data.join("campaigns.csv")).unwrap_or_default());
-    let ncamp = crows.len();
     let campaigns: Lookup<u32> =
         Lookup::new(&crows.iter().enumerate().map(|(i, r)| (&r[0][..], i as u32)).collect::<Vec<_>>());
+
+    // SESSIONS_WIDE forces the general layout, for testing it on ordinary data.
+    let narrow = cats.len() <= 256 && we - (ws - REACH) <= u32::MAX as i64 && std::env::var_os("SESSIONS_WIDE").is_none();
+    let c = Ctx { t0, data, out, threads, ws, we, first_day, ndays, cats, products, unknown, campaigns, crows };
+    if narrow { run::<Narrow>(&c) } else { run::<Wide>(&c) }
+}
+
+fn run<R: Rec>(c: &Ctx) -> ! {
+    let lap = |what: &str| eprintln!("{:>8.3}s  {what}", c.t0.elapsed().as_secs_f64());
+    let (data, out, threads, ws, we, first_day, ndays) = (&c.data, &c.out, c.threads, c.ws, c.we, c.first_day, c.ndays);
+    let (cats, products, unknown, campaigns, crows) = (&c.cats, &c.products, c.unknown, &c.campaigns, &c.crows);
+    let ncamp = crows.len();
+    let base = ws - REACH;
 
     let keys = Keys::new();
     let links = Input::open(&data.join("links"), 4 << 20);
@@ -335,16 +426,7 @@ fn main() {
                         if f.len(0) == 0 {
                             return;
                         }
-                        let mut r = Raw {
-                            eid: keys.field(f, 0),
-                            ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX),
-                            uid: 0,
-                            ts: 0,
-                            price: 0,
-                            cat: 0,
-                            kind: 0,
-                            ok: false,
-                        };
+                        let mut r = Raw { eid: keys.field(f, 0), ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX), uid: 0, t: R::t(0), pc: R::BAD };
                         let kind = match f.get(4) {
                             b"view" => Some(0),
                             b"cart" => Some(1),
@@ -360,12 +442,9 @@ fn main() {
                         {
                             let p = if kind == PURCHASE { price(f.get(6)) } else { Some(0) };
                             if let Some(p) = p {
-                                r.ok = true;
-                                r.ts = t;
-                                r.kind = kind;
-                                r.price = p;
+                                r.t = R::t(t - base);
+                                r.pc = R::pc(p, if p != 0 { products.field(f, 5).unwrap_or(unknown) } else { 0 });
                                 r.uid = keys.field(f, 1);
-                                r.cat = products.field(f, 5).unwrap_or(unknown);
                             }
                         }
                         ev[bucket(r.eid, nbe)].push(r);
@@ -382,7 +461,7 @@ fn main() {
                             return;
                         }
                         let Some(camp) = campaigns.field(f, 2) else { return };
-                        ck.push(Click { person: keys.field(f, 1), ts: t, cid: keys.field(f, 0), camp });
+                        ck.push(Click { person: keys.field(f, 1), cid: keys.field(f, 0), t: R::t(t - base), camp });
                     });
                 }
             },
@@ -430,12 +509,12 @@ fn main() {
             let mask = cap - 1;
             // One pass: the first copy of an event_id appends its event to `kept` and
             // its slot remembers where; an earlier-ingested copy overwrites it in place.
-            // A kept copy that failed validation stays, as NOT_OK, and is dropped below.
+            // A kept copy that failed validation stays, as BAD, and is dropped below.
             slots.clear();
             slots.resize(cap, (u64::MAX, 0));
             kept.clear();
             ingest.clear();
-            let ev = |r: &Raw| Ev { person: r.uid, ts: r.ts, price: r.price, cat: r.cat, kind: if r.ok { r.kind } else { NOT_OK } };
+            let ev = |r: &Raw<R>| Ev { person: r.uid, t: r.t, pc: r.pc };
             for r in parsed.iter().flat_map(|p| p.ev[b].iter()) {
                 let mut s = (r.eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
                 loop {
@@ -456,7 +535,7 @@ fn main() {
                     s = (s + 1) & mask;
                 }
             }
-            kept.retain(|e| e.kind != NOT_OK);
+            kept.retain(|e| e.pc != R::BAD);
             for i in 0..kept.len() {
                 if i + AHEAD < kept.len() {
                     persons.prefetch(kept[i + AHEAD].person);
@@ -497,7 +576,7 @@ fn main() {
             for x in 0..np {
                 eoff[x + 1] += eoff[x];
             }
-            let mut ev: Vec<Ev> = Vec::with_capacity(n_ev);
+            let mut ev: Vec<Ev<R>> = Vec::with_capacity(n_ev);
             {
                 let mut at = eoff.clone();
                 let out = ev.spare_capacity_mut();
@@ -523,7 +602,7 @@ fn main() {
                 coff[x + 1] += coff[x];
             }
             let nck = coff[np] as usize;
-            let mut ck: Vec<Click> = Vec::with_capacity(nck);
+            let mut ck: Vec<Click<R>> = Vec::with_capacity(nck);
             {
                 let mut at = coff.clone();
                 let out = ck.spare_capacity_mut();
@@ -539,14 +618,14 @@ fn main() {
             for x in 0..np {
                 let es = &mut ev[eoff[x] as usize..eoff[x + 1] as usize];
                 if es.len() > 1 {
-                    es.sort_unstable_by_key(|e| e.ts);
+                    es.sort_unstable_by_key(|e| e.t);
                 }
                 let cl = &mut ck[coff[x] as usize..coff[x + 1] as usize];
                 if cl.len() > 1 {
                     if interned {
-                        cl.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| keys.cmp(x.cid, y.cid)));
+                        cl.sort_unstable_by(|x, y| x.t.cmp(&y.t).then_with(|| keys.cmp(x.cid, y.cid)));
                     } else {
-                        cl.sort_unstable_by_key(|c| (c.ts, c.cid));
+                        cl.sort_unstable_by_key(|c| (c.t, c.cid));
                     }
                 }
             }
@@ -583,24 +662,26 @@ fn main() {
                 let mut hi = 0usize;
                 let mut j = 0usize;
                 while j < es.len() {
-                    let start = es[j].ts;
-                    let day = (start.div_euclid(DAY) - first_day) as u32;
+                    let start = R::off(es[j].t);
+                    let day = ((base + start).div_euclid(DAY) - first_day) as u32;
                     if let Some(u) = row.take_if(|u| u.day != day) {
                         users.push(close(u, &mut catrev, &mut touched));
                     }
                     let (mut n, mut rev, mut bought) = (0u32, 0u64, false);
                     let mut last = start;
-                    while j < es.len() && es[j].ts - last <= GAP {
+                    while j < es.len() && R::off(es[j].t) - last <= GAP {
                         let e = es[j];
-                        last = e.ts;
+                        last = R::off(e.t);
                         n += 1;
-                        if e.kind == PURCHASE {
-                            rev += e.price as u64;
+                        let price = R::price(e.pc);
+                        if price != 0 {
+                            let c = R::cat(e.pc);
+                            rev += price as u64;
                             bought = true;
-                            if catrev[e.cat as usize] == 0 {
-                                touched.push(e.cat);
+                            if catrev[c] == 0 {
+                                touched.push(c as u16);
                             }
-                            catrev[e.cat as usize] += e.price as u64;
+                            catrev[c] += price as u64;
                         }
                         j += 1;
                     }
@@ -613,14 +694,14 @@ fn main() {
 
                     // Credit: the latest click at or before the start, within 7 days;
                     // on a tie the smallest click_id, which sorts first.
-                    while hi < cl.len() && cl[hi].ts <= start {
+                    while hi < cl.len() && R::off(cl[hi].t) <= start {
                         hi += 1;
                     }
                     let mut credited = organic;
-                    if hi > 0 && start - cl[hi - 1].ts <= REACH {
-                        let t = cl[hi - 1].ts;
+                    if hi > 0 && start - R::off(cl[hi - 1].t) <= REACH {
+                        let t = cl[hi - 1].t;
                         let mut g = hi - 1;
-                        while g > 0 && cl[g - 1].ts == t {
+                        while g > 0 && cl[g - 1].t == t {
                             g -= 1;
                         }
                         credited = cl[g].camp as usize;
@@ -652,7 +733,7 @@ fn main() {
                     q = s;
                 }
                 by_camp.clear();
-                by_camp.extend(cl.iter().map(|x| (x.camp, x.ts)));
+                by_camp.extend(cl.iter().map(|x| (x.camp, R::off(x.t))));
                 by_camp.sort_unstable();
                 let mut g = 0;
                 while g < by_camp.len() {
@@ -679,10 +760,10 @@ fn main() {
     );
     lap("sessions");
 
-    write_outputs(&out, threads, &rows, &accs, &keys, &cats, &crows, first_day, ndays).expect("write outputs");
+    write_outputs(out, threads, &rows, &accs, &keys, cats, crows, first_day, ndays).expect("write outputs");
     lap("written");
     // The OS frees everything faster than our destructors would.
-    std::process::exit(0);
+    std::process::exit(0)
 }
 
 #[allow(clippy::too_many_arguments)]
