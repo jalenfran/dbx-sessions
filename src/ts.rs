@@ -34,9 +34,46 @@ pub fn parse(s: &[u8]) -> Option<i64> {
     }
 }
 
+/// Eight ASCII digits, most significant first in a little-endian word, or None.
+/// lean/Sessions/Epoch.lean proves both halves for every word: `digits8` accepts exactly
+/// the words of 8 digits, and `value8` then equals their decimal value.
+#[inline(always)]
+fn digits8(w: u64) -> Option<u64> {
+    // Every byte in 0x30..=0x3f, and still so after adding 6 (no carry can cross a
+    // byte once the first test holds): exactly '0'..='9'.
+    const HI: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    if w & HI != ZEROS || w.wrapping_add(0x0606_0606_0606_0606) & HI != ZEROS {
+        return None;
+    }
+    Some(value8(w))
+}
+
+#[inline(always)]
+fn value8(w: u64) -> u64 {
+    let v = w & 0x0f0f_0f0f_0f0f_0f0f;
+    let v = (v.wrapping_mul(10).wrapping_add(v >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let v = (v.wrapping_mul(100).wrapping_add(v >> 16)) & 0x0000_ffff_0000_ffff;
+    (v.wrapping_mul(10000).wrapping_add(v >> 32)) & 0xffff_ffff
+}
+
 /// F3. Leading zeros are fine; a value past i64 is outside every window, so bad.
+/// Up to 16 digits take two word loads (the first 1 to 8 digits shifted up and padded
+/// with '0' in front); longer ones, rare, the digit loop.
 #[inline]
 fn epoch(s: &[u8]) -> Option<i64> {
+    let n = s.len();
+    if (9..=16).contains(&n) {
+        let k = n - 8;
+        let head = (word(s, 0) << (8 * (8 - k))) | (0x3030_3030_3030_3030u64.checked_shr(8 * k as u32).unwrap_or(0));
+        let (hi, lo) = (digits8(head)?, digits8(word(s, n - 8))?);
+        return Some((hi * 100_000_000 + lo) as i64);
+    }
+    epoch_loop(s)
+}
+
+#[inline]
+fn epoch_loop(s: &[u8]) -> Option<i64> {
     let mut v: u64 = 0;
     for &c in s {
         let d = c.wrapping_sub(b'0');
@@ -226,6 +263,29 @@ mod tests {
                 for d in [1, 28, month_days(y, m)] {
                     assert_eq!(days(y, m, d), days_from_civil(y, m, d), "{y}-{m}-{d}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_matches_loop() {
+        let alphabet = b"0123456789/:.-e ";
+        let mut r: u64 = 11;
+        let mut next = || {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            r >> 33
+        };
+        for _ in 0..2_000_000 {
+            let n = 1 + next() as usize % 24;
+            let s: Vec<u8> = (0..n)
+                .map(|_| if next() % 16 == 0 { alphabet[next() as usize % alphabet.len()] } else { b'0' + (next() % 10) as u8 })
+                .collect();
+            assert_eq!(epoch(&s), epoch_loop(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for v in [0u64, 1, 9, 10, 99_999_999, 100_000_000, 1_791_071_890_000, 9_999_999_999_999_999] {
+            for pad in 0..4 {
+                let s = format!("{}{v}", "0".repeat(pad));
+                assert_eq!(epoch(s.as_bytes()), Some(v as i64), "{s}");
             }
         }
     }

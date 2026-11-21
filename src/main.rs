@@ -307,6 +307,18 @@ struct Dedup<R: Rec> {
     ingest: Vec<i64>,
 }
 
+/// Stage 3, per thread: credited sessions, purchasing sessions and revenue per
+/// (campaign, day) in `camp`; assists apart in `assist`, small enough to stay cached;
+/// and each campaign's open assist interval (`NONE` when closed).
+struct Acc {
+    camp: Vec<[u64; 4]>,
+    assist: Vec<u32>,
+    open: Vec<(i64, i64)>,
+    opened: Vec<u32>,
+}
+
+const NONE: i64 = i64::MIN;
+
 /// What `run` needs from the small tables.
 struct Ctx {
     t0: Instant,
@@ -556,8 +568,9 @@ fn run<R: Rec>(c: &Ctx) -> ! {
     let (rows, accs) = par::run(
         nb,
         threads,
-        || vec![[0u64; 4]; width],
-        |camp, b| {
+        || Acc { camp: vec![[0u64; 4]; width], assist: vec![0; width], open: vec![(NONE, 0); ncamp], opened: Vec::new() },
+        |acc, b| {
+            let Acc { camp, assist, open, opened } = acc;
             // Group by person, in no particular person order: number the bucket's people
             // densely, counting-sort events and clicks by that number straight out of the
             // parts, then sort each person's own run by time. Clicks of people with no
@@ -636,7 +649,6 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             let mut starts: Vec<i64> = Vec::new();
             let mut sday: Vec<u32> = Vec::new();
             let mut day_end: Vec<u32> = Vec::new();
-            let mut by_camp: Vec<(u32, i64)> = Vec::new();
 
             let close = |u: UserRow, catrev: &mut [u64], touched: &mut Vec<u16>| -> UserRow {
                 let mut best: Option<(u64, u16)> = None;
@@ -732,32 +744,52 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                     day_end[s..q].fill(q as u32);
                     q = s;
                 }
-                by_camp.clear();
-                by_camp.extend(cl.iter().map(|x| (x.camp, R::off(x.t))));
-                by_camp.sort_unstable();
-                let mut g = 0;
-                while g < by_camp.len() {
-                    let k = by_camp[g].0;
-                    let lo = by_camp[g].1;
-                    let mut hi_t = lo + REACH;
-                    g += 1;
-                    while g < by_camp.len() && by_camp[g].0 == k && by_camp[g].1 <= hi_t {
-                        hi_t = by_camp[g].1 + REACH;
-                        g += 1;
-                    }
+                // Clicks are in time order, so each campaign's are too: keep one open
+                // interval per campaign, extend it while its next click starts inside it,
+                // and count it once it is closed.
+                let mut flush = |k: u32, lo: i64, hi: i64| {
                     let a = starts.partition_point(|&s| s < lo);
-                    let z = starts.partition_point(|&s| s <= hi_t);
+                    let z = starts.partition_point(|&s| s <= hi);
                     let mut q = a;
                     while q < z {
                         let e = (day_end[q] as usize).min(z);
-                        camp[k as usize * ndays + sday[q] as usize][3] += (e - q) as u64;
+                        assist[k as usize * ndays + sday[q] as usize] += (e - q) as u32;
                         q = e;
                     }
+                };
+                for x in cl {
+                    let (k, t) = (x.camp, R::off(x.t));
+                    let o = &mut open[k as usize];
+                    if o.0 == NONE {
+                        opened.push(k);
+                    } else if t <= o.1 {
+                        o.1 = t + REACH;
+                        continue;
+                    } else {
+                        flush(k, o.0, o.1);
+                    }
+                    open[k as usize] = (t, t + REACH);
                 }
+                for &k in opened.iter() {
+                    let (lo, hi) = open[k as usize];
+                    flush(k, lo, hi);
+                    open[k as usize].0 = NONE;
+                }
+                opened.clear();
             }
             users
         },
     );
+    let accs: Vec<Vec<[u64; 4]>> = accs
+        .into_iter()
+        .map(|a| {
+            let mut c = a.camp;
+            for (x, &n) in c.iter_mut().zip(&a.assist) {
+                x[3] = n as u64;
+            }
+            c
+        })
+        .collect();
     lap("sessions");
 
     write_outputs(out, threads, &rows, &accs, &keys, cats, crows, first_day, ndays).expect("write outputs");
