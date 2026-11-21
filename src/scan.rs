@@ -1,7 +1,11 @@
 //! CSV dialect of rules.md in one pass. Each 64-byte block becomes three bitmasks
-//! (`,` `"` `\n`); walking their set bits finds every field and checks its quoting.
-//! A field is fine with no quote, or with exactly two, at its first and last byte.
-//! A line is passed to `f` only when it has exactly N fields, all fine.
+//! (`,` `"` `\n`). Walking the set bits of `,` and `\n` finds every field; the
+//! quotes in a field are counted with popcount, never visited one by one. A field is
+//! fine with no quote, or with exactly two, at its first and last byte. A line is
+//! passed to `f` only when it has exactly N fields, all fine.
+
+use crate::key;
+use crate::swar;
 
 pub const BLOCK: usize = 64;
 
@@ -12,22 +16,10 @@ struct Masks {
     nl: u64,
 }
 
-const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const ONES: u64 = 0x0101_0101_0101_0101;
-
-/// High bit of every byte of `x` that is zero; exact, no false positives
-/// (lean/Sessions/Swar.lean).
-#[inline(always)]
-fn zero_bytes(x: u64) -> u64 {
-    !(((x & LO7).wrapping_add(LO7)) | x | LO7)
-}
-
-/// The 8 high bits of `hb` gathered into one byte, byte i to bit i. The partial
-/// products of the multiply never overlap, so there are no carries.
-#[inline(always)]
-fn gather(hb: u64) -> u64 {
-    ((hb >> 7).wrapping_mul(0x0102_0408_1020_4080)) >> 56
-}
+/// Bytes a buffer must hold past its data: whole blocks, plus room for 16-byte loads
+/// at any field start (`Row::word`).
+pub const SLACK: usize = BLOCK + 16;
 
 #[inline(always)]
 #[allow(dead_code)]
@@ -35,9 +27,9 @@ fn masks_swar(b: &[u8; BLOCK]) -> Masks {
     let mut m = Masks { comma: 0, quote: 0, nl: 0 };
     for i in 0..8 {
         let w = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
-        m.comma |= gather(zero_bytes(w ^ (ONES * b',' as u64))) << (i * 8);
-        m.quote |= gather(zero_bytes(w ^ (ONES * b'"' as u64))) << (i * 8);
-        m.nl |= gather(zero_bytes(w ^ (ONES * b'\n' as u64))) << (i * 8);
+        m.comma |= swar::gather(swar::zero_bytes(w ^ (ONES * b',' as u64))) << (i * 8);
+        m.quote |= swar::gather(swar::zero_bytes(w ^ (ONES * b'"' as u64))) << (i * 8);
+        m.nl |= swar::gather(swar::zero_bytes(w ^ (ONES * b'\n' as u64))) << (i * 8);
     }
     m
 }
@@ -94,83 +86,136 @@ fn masks(b: &[u8; BLOCK]) -> Masks {
     masks_swar(b)
 }
 
-/// Calls `f` with the N unquoted fields of every well-formed line of `buf[..len]`.
-/// `buf.len()` is a multiple of `BLOCK` and every byte from `len` on is zero.
+/// One well-formed line: N fields as spans of the scanned buffer.
+pub struct Row<'a, const N: usize> {
+    buf: &'a [u8],
+    spans: [(u32, u32); N],
+}
+
+impl<'a, const N: usize> Row<'a, N> {
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> &'a [u8] {
+        let (s, e) = self.spans[i];
+        // The scanner only makes spans inside buf.
+        unsafe { self.buf.get_unchecked(s as usize..e as usize) }
+    }
+
+    #[inline(always)]
+    pub fn len(&self, i: usize) -> usize {
+        (self.spans[i].1 - self.spans[i].0) as usize
+    }
+
+    /// `key::pack` of field i, from one 8-byte load (the buffer has SLACK past its data).
+    #[inline(always)]
+    pub fn pack(&self, i: usize) -> Option<u64> {
+        let s = self.spans[i].0 as usize;
+        let w = u64::from_be_bytes(self.buf[s..s + 8].try_into().unwrap());
+        key::pack_word(w, self.buf[s + 8], self.len(i))
+    }
+}
+
+/// Calls `f` with every well-formed line of `buf[..len]`. Every byte of `buf` from
+/// `len` on is zero, and there are at least `SLACK` of them.
+///
+/// Two stages per window of blocks. Stage 1 writes the position of every `,` and `\n`
+/// to `pos`, and for every `\n` the number of quotes before it to `nls`. Stage 2 takes
+/// the lines one by one: a line is well-formed iff its N-th delimiter is its own `\n`
+/// (exactly N - 1 commas before it) and its quotes are right. For quotes, call a field
+/// *wrapped* when it is at least 2 bytes long and starts and ends with `"`. A wrapped
+/// field holds at least 2 quotes, so the line holds at least 2 * wrapped, with equality
+/// iff every wrapped field holds exactly its 2 and every other field none: exactly the
+/// dialect's rule. So one popcount difference checks the whole line.
 #[inline(always)]
-#[allow(unused_assignments)]
-pub fn lines<'a, const N: usize, F: FnMut(&[&'a [u8]; N])>(buf: &'a [u8], len: usize, mut f: F) {
-    debug_assert!(N >= 2 && buf.len() % BLOCK == 0 && buf.len() >= len);
-    let mut fields: [&'a [u8]; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut bad = false;
-    let mut fstart = 0usize;
-    let mut nq = 0u32;
-    let mut qfirst = 0usize;
-    let mut qlast = 0usize;
+pub fn lines<'a, const N: usize, F: FnMut(&Row<'a, N>)>(buf: &'a [u8], len: usize, mut f: F) {
+    assert!(N >= 2 && buf.len() >= len + SLACK && len < u32::MAX as usize - 1);
+    const WINDOW: usize = 64;
+    let mut row = Row { buf, spans: [(0, 0); N] };
+    let mut pos: Vec<u32> = Vec::with_capacity(WINDOW * BLOCK / 2);
+    let mut nls: Vec<(u32, u32)> = Vec::with_capacity(WINDOW * BLOCK / 8);
+    let mut qblock = 0u32;
+    // The current line: its start, the quotes before it, and its first delimiter in pos.
+    let mut start = 0u32;
+    let mut qstart = 0u32;
 
-    macro_rules! close {
-        ($end:expr) => {{
-            let end = $end;
-            if nf < N {
-                if nq == 0 {
-                    fields[nf] = unsafe { buf.get_unchecked(fstart..end) };
-                } else if nq == 2 && qfirst == fstart && qlast + 1 == end {
-                    fields[nf] = unsafe { buf.get_unchecked(fstart + 1..end - 1) };
-                } else {
-                    bad = true;
-                }
-            } else {
-                bad = true;
+    let mut line = |pos: &[u32], j: &mut usize, nl: u32, q: u32, start: &mut u32, qstart: &mut u32| {
+        let ok = *j + N <= pos.len() && pos[*j + N - 1] == nl;
+        if ok {
+            let mut s = *start;
+            let mut wrapped = 0u32;
+            for k in 0..N {
+                let e = pos[*j + k];
+                let w = e >= s + 2 && buf[s as usize] == b'"' && buf[e as usize - 1] == b'"';
+                wrapped += w as u32;
+                row.spans[k] = (s + w as u32, e - w as u32);
+                s = e + 1;
             }
-            nf += 1;
-            nq = 0;
-            fstart = end + 1;
-        }};
-    }
+            if q - *qstart == 2 * wrapped {
+                f(&row);
+            }
+            *j += N;
+        } else {
+            while pos[*j] != nl {
+                *j += 1;
+            }
+            *j += 1;
+        }
+        *start = nl + 1;
+        *qstart = q;
+    };
 
-    let mut base = 0;
+    let mut base = 0usize;
     while base < len {
-        let m = masks(buf[base..base + BLOCK].try_into().unwrap());
-        let mut bits = m.comma | m.quote | m.nl;
-        while bits != 0 {
-            let t = bits.trailing_zeros();
-            let i = base + t as usize;
-            let bit = 1u64 << t;
-            bits &= bits - 1;
-            if m.comma & bit != 0 {
-                close!(i);
-            } else if m.quote & bit != 0 {
-                if nq == 0 {
-                    qfirst = i;
+        let end = (base + WINDOW * BLOCK).min(len.div_ceil(BLOCK) * BLOCK);
+        while base < end {
+            let m = masks(buf[base..base + BLOCK].try_into().unwrap());
+            // Positions of the set bits, 8 at a time with unconditional writes (simdjson's
+            // flatten): the spare entries past `n` are garbage, overwritten next block.
+            let mut bits = m.comma | m.nl;
+            let n = bits.count_ones() as usize;
+            let at = pos.len();
+            // A block has at most 64 delimiters, so 64 slots past `at` cover every round.
+            pos.reserve(BLOCK);
+            unsafe {
+                let p = pos.as_mut_ptr().add(at);
+                let mut k = 0;
+                while k < n {
+                    for i in 0..8 {
+                        *p.add(k + i) = base as u32 + bits.trailing_zeros();
+                        bits &= bits.wrapping_sub(1);
+                    }
+                    k += 8;
                 }
-                nq += 1;
-                qlast = i;
-            } else {
-                close!(i);
-                // An empty line is one empty field, so it fails nf == N (N >= 2).
-                if !bad && nf == N {
-                    f(&fields);
-                }
-                nf = 0;
-                bad = false;
+                pos.set_len(at + n);
             }
+            let mut nlb = m.nl;
+            while nlb != 0 {
+                let t = nlb.trailing_zeros();
+                nlb &= nlb - 1;
+                nls.push((base as u32 + t, qblock + (m.quote & ((1u64 << t) - 1)).count_ones()));
+            }
+            qblock += m.quote.count_ones();
+            base += BLOCK;
         }
-        base += BLOCK;
+        let mut j = 0usize;
+        for &(nl, q) in &nls {
+            line(&pos, &mut j, nl, q, &mut start, &mut qstart);
+        }
+        nls.clear();
+        pos.drain(..j);
     }
-    // A last line with no '\n'.
-    if fstart < len || nf > 0 {
-        close!(len);
-        if !bad && nf == N {
-            f(&fields);
-        }
+    // A last line with no '\n': end it at len.
+    if (start as usize) < len || !pos.is_empty() {
+        pos.push(len as u32);
+        let mut j = 0;
+        line(&pos, &mut j, len as u32, qblock, &mut start, &mut qstart);
     }
 }
 
 /// `data` copied into a zero-padded buffer that `lines` accepts.
 pub fn padded(data: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(data.len().div_ceil(BLOCK) * BLOCK + BLOCK);
+    let mut v = Vec::with_capacity(data.len().div_ceil(BLOCK) * BLOCK + SLACK);
     v.extend_from_slice(data);
-    v.resize(data.len().div_ceil(BLOCK) * BLOCK, 0);
+    v.resize(data.len().div_ceil(BLOCK) * BLOCK + SLACK, 0);
     v
 }
 
@@ -182,7 +227,7 @@ pub fn rows<const N: usize>(data: &[u8]) -> Vec<[Vec<u8>; N]> {
     };
     let buf = padded(body);
     let mut out = Vec::new();
-    lines::<N, _>(&buf, body.len(), |f| out.push(f.map(|x| x.to_vec())));
+    lines::<N, _>(&buf, body.len(), |r| out.push(std::array::from_fn(|i| r.get(i).to_vec())));
     out
 }
 
@@ -221,7 +266,7 @@ mod tests {
     fn fast<const N: usize>(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let buf = padded(data);
         let mut out = Vec::new();
-        lines::<N, _>(&buf, data.len(), |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        lines::<N, _>(&buf, data.len(), |r| out.push((0..N).map(|i| r.get(i).to_vec()).collect()));
         out
     }
 

@@ -2,18 +2,22 @@
 //!
 //! An ID of at most 9 bytes, every byte in 0x01..=0x7f, packs 7 bits per byte, first
 //! byte most significant, zero padded on the right (`pack`). Zero padding sorts before
-//! every real byte, so a prefix sorts first, exactly like a byte-wise compare
-//! (lean/Sessions/Key.lean proves order preservation and injectivity). Every generator
-//! ID packs. Anything else is interned and gets a key with the top bit set; those only
+//! every real byte, so a prefix sorts first, exactly like a byte-wise compare. Every
+//! generator ID packs. `pack_word` is the hot path: one 8-byte load, `swar::compress`
+//! (proved equal to the byte-wise packing in lean/Sessions/Key.lean) and a validity mask. Anything else is interned and gets a key with the top bit set; those only
 //! compare by looking the bytes back up (`Keys::cmp`).
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::scan::Row;
+use crate::swar;
+
 pub const INTERNED: u64 = 1 << 63;
 const SHARDS: usize = 64;
 
+/// The packing, one byte at a time: the definition `pack_word` must match.
 #[inline(always)]
 pub fn pack(b: &[u8]) -> Option<u64> {
     if b.len() > 9 {
@@ -26,6 +30,25 @@ pub fn pack(b: &[u8]) -> Option<u64> {
         k = (k << 7) | c as u64;
     }
     if bad { None } else { Some(k << (7 * (9 - b.len()))) }
+}
+
+/// `pack` of an ID of `len` bytes, given the big-endian word of its first 8 bytes and
+/// its 9th byte, each read from a buffer that continues past the ID (any bytes past
+/// `len` are ignored).
+#[inline(always)]
+pub fn pack_word(w: u64, ninth: u8, len: usize) -> Option<u64> {
+    if len > 9 {
+        return None;
+    }
+    let n8 = len.min(8) as u32;
+    let keep = u64::MAX.checked_shl(64 - 8 * n8).unwrap_or(0);
+    let w = w & keep;
+    let ninth = if len == 9 { ninth } else { 1 };
+    let bad = (w & swar::HI) | (swar::zero_bytes(w) & keep);
+    if bad != 0 || ninth.wrapping_sub(1) >= 0x7f {
+        return None;
+    }
+    Some(swar::compress(w) << 7 | (if len == 9 { ninth as u64 } else { 0 }))
 }
 
 pub fn unpack(k: u64, out: &mut Vec<u8>) {
@@ -54,11 +77,20 @@ impl Keys {
         Keys { shards: (0..SHARDS).map(|_| Mutex::default()).collect() }
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     pub fn key(&self, b: &[u8]) -> u64 {
         match pack(b) {
             Some(k) => k,
             None => self.intern(b),
+        }
+    }
+
+    /// `key` of field `i` of a scanned row, by the word path.
+    #[inline(always)]
+    pub fn field<const N: usize>(&self, row: &Row<N>, i: usize) -> u64 {
+        match row.pack(i) {
+            Some(k) => k,
+            None => self.intern(row.get(i)),
         }
     }
 
@@ -178,10 +210,10 @@ impl<V: Copy + Default> Lookup<V> {
     }
 
     #[inline(always)]
-    pub fn get(&self, b: &[u8]) -> Option<V> {
-        match pack(b) {
+    pub fn field<const N: usize>(&self, row: &Row<N>, i: usize) -> Option<V> {
+        match row.pack(i) {
             Some(k) => self.packed.get(k),
-            None => self.other.get(b).copied(),
+            None => self.other.get(row.get(i)).copied(),
         }
     }
 }
@@ -211,6 +243,23 @@ mod tests {
         let mut v = Vec::new();
         k.bytes(b, &mut v);
         assert_eq!(v, b"u1234567890");
+    }
+
+    #[test]
+    fn word_path_matches() {
+        let mut r: u64 = 3;
+        let alphabet = b"\x00\x01az09 \x7f\x80\xff\"u";
+        for _ in 0..1_000_000 {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let len = (r >> 59) as usize % 12;
+            let mut buf = [0u8; 16];
+            for (i, c) in buf.iter_mut().enumerate() {
+                let x = r.rotate_left(5 * i as u32) ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                *c = if x & 3 == 0 { alphabet[(x >> 8) as usize % alphabet.len()] } else { b'a' + (x >> 16) as u8 % 26 };
+            }
+            let w = u64::from_be_bytes(buf[..8].try_into().unwrap());
+            assert_eq!(pack_word(w, buf[8], len), pack(&buf[..len]), "{:?}", &buf[..len]);
+        }
     }
 
     #[test]

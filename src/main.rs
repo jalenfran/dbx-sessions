@@ -13,6 +13,7 @@ mod key;
 mod par;
 mod parquet;
 mod scan;
+mod swar;
 mod ts;
 
 use std::fs::File;
@@ -121,12 +122,12 @@ impl Input {
     fn read(&self, i: usize, buf: &mut Vec<u8>) -> usize {
         let (f, s, e) = self.chunks[i];
         let n = (e - s) as usize;
-        let padded = n.div_ceil(scan::BLOCK) * scan::BLOCK;
+        let padded = n.div_ceil(scan::BLOCK) * scan::BLOCK + scan::SLACK;
         if buf.len() < padded {
             buf.resize(padded, 0);
         }
         self.files[f as usize].read_exact_at(&mut buf[..n], s).expect("read input");
-        buf[n..padded].fill(0);
+        buf[n..].fill(0);
         n
     }
 }
@@ -229,6 +230,18 @@ struct Parse {
 }
 
 fn main() {
+    if let Some(p) = std::env::var_os("BENCH_SCAN") {
+        let data = std::fs::read(p).unwrap();
+        let buf = scan::padded(&data);
+        for _ in 0..3 {
+            let t = Instant::now();
+            let mut c = 0u64;
+            scan::lines::<7, _>(&buf, data.len(), |r| c += r.len(2) as u64);
+            let el = t.elapsed().as_secs_f64();
+            eprintln!("scan {:.3}s {:.2} GB/s ({c})", el, data.len() as f64 / el / 1e9);
+        }
+        return;
+    }
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("{:>8.3}s  {what}", t0.elapsed().as_secs_f64());
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
@@ -266,9 +279,9 @@ fn main() {
         |buf, i| {
             let n = links.read(i, buf);
             let mut v = Vec::new();
-            scan::lines::<2, _>(buf, n, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((keys.key(f[0]), keys.key(f[1])));
+            scan::lines::<2, _>(buf, n, |r| {
+                if r.len(0) != 0 && r.len(1) != 0 {
+                    v.push((keys.field(r, 0), keys.field(r, 1)));
                 }
             });
             v
@@ -294,12 +307,12 @@ fn main() {
                 let n = events.read(i, &mut st.buf);
                 let Parse { buf, ev, .. } = st;
                 scan::lines::<7, _>(buf, n, |f| {
-                    if f[0].is_empty() {
+                    if f.len(0) == 0 {
                         return;
                     }
                     let mut r = Raw {
-                        eid: keys.key(f[0]),
-                        ingest: ts::parse(f[3]).unwrap_or(i64::MAX),
+                        eid: keys.field(f, 0),
+                        ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX),
                         uid: 0,
                         ts: 0,
                         price: 0,
@@ -307,27 +320,27 @@ fn main() {
                         kind: 0,
                         ok: false,
                     };
-                    let kind = match f[4] {
+                    let kind = match f.get(4) {
                         b"view" => Some(0),
                         b"cart" => Some(1),
                         b"purchase" => Some(PURCHASE),
                         _ => None,
                     };
-                    if let (Some(t), Some(kind)) = (ts::parse(f[2]), kind)
+                    if let (Some(t), Some(kind)) = (ts::parse(f.get(2)), kind)
                         && t >= ws
                         && t < we
-                        && !f[1].is_empty()
-                        && !f[5].is_empty()
+                        && f.len(1) != 0
+                        && f.len(5) != 0
                         && r.ingest.saturating_sub(t) <= LATE
                     {
-                        let p = if kind == PURCHASE { price(f[6]) } else { Some(0) };
+                        let p = if kind == PURCHASE { price(f.get(6)) } else { Some(0) };
                         if let Some(p) = p {
                             r.ok = true;
                             r.ts = t;
                             r.kind = kind;
                             r.price = p;
-                            r.uid = keys.key(f[1]);
-                            r.cat = products.get(f[5]).unwrap_or(unknown);
+                            r.uid = keys.field(f, 1);
+                            r.cat = products.field(f, 5).unwrap_or(unknown);
                         }
                     }
                     ev[bucket(r.eid, nb)].push(r);
@@ -336,16 +349,16 @@ fn main() {
                 let n = clicks.read(i - nev, &mut st.buf);
                 let Parse { buf, ck, .. } = st;
                 scan::lines::<4, _>(buf, n, |f| {
-                    if f[0].is_empty() || f[1].is_empty() {
+                    if f.len(0) == 0 || f.len(1) == 0 {
                         return;
                     }
-                    let Some(t) = ts::parse(f[3]) else { return };
+                    let Some(t) = ts::parse(f.get(3)) else { return };
                     if t < ws - REACH || t >= we {
                         return;
                     }
-                    let Some(camp) = campaigns.get(f[2]) else { return };
-                    let p = person(keys.key(f[1]));
-                    ck[bucket(p, nb)].push(Click { person: p, ts: t, cid: keys.key(f[0]), camp });
+                    let Some(camp) = campaigns.field(f, 2) else { return };
+                    let p = person(keys.field(f, 1));
+                    ck[bucket(p, nb)].push(Click { person: p, ts: t, cid: keys.field(f, 0), camp });
                 });
             }
         },

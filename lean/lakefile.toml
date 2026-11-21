@@ -1,0 +1,5 @@
+name = "sessions"
+defaultTargets = ["Sessions"]
+
+[[lean_lib]]
+name = "Sessions"
