@@ -519,10 +519,25 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             let Dedup { ev: outb, slots, kept, ingest, .. } = st;
             let parts: Vec<Vec<Raw<R>>> = raws.iter().map(|t| std::mem::take(&mut *t[b].lock().unwrap())).collect();
             let n: usize = parts.iter().map(|p| p.len()).sum();
-            let cap = (n * 2).next_power_of_two().max(16);
+            let bits = (n * 8).next_power_of_two().max(64);
+            let hash = |id: u64| id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let bit_index = |id| (hash(id) >> (64 - bits.trailing_zeros())) as usize;
+            let mut seen = vec![0u64; bits / 64];
+            let mut repeated = vec![0u64; bits / 64];
+            let mut hits = 0;
+            for r in parts.iter().flatten() {
+                let i = bit_index(r.eid);
+                let bit = 1u64 << (i & 63);
+                let previous = seen[i / 64] & bit;
+                seen[i / 64] |= bit;
+                repeated[i / 64] |= previous;
+                hits += usize::from(previous != 0);
+            }
+            // Each repeated bit represents at most twice its number of later hits.
+            let cap = (4 * hits).next_power_of_two().max(16);
             let shift = 64 - cap.trailing_zeros();
             let mask = cap - 1;
-            // One pass: the first copy of an event_id appends its event to `kept` and
+            // For possible duplicates, the first event_id appends its event to `kept` and
             // its slot remembers where; an earlier-ingested copy overwrites it in place.
             // A kept copy that failed validation stays, as BAD, and is dropped below.
             slots.clear();
@@ -532,9 +547,12 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             let ev = |r: &Raw<R>| Ev { person: r.uid, t: r.t, pc: r.pc };
             let slot = |eid: u64| (eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
             for part in &parts {
-                for (j, r) in part.iter().enumerate() {
-                    if let Some(a) = part.get(j + 8) {
-                        par::prefetch(&slots[slot(a.eid)]);
+                for r in part {
+                    let i = bit_index(r.eid);
+                    if repeated[i / 64] & (1u64 << (i & 63)) == 0 {
+                        kept.push(ev(r));
+                        ingest.push(r.ingest);
+                        continue;
                     }
                     let mut s = slot(r.eid);
                     loop {
