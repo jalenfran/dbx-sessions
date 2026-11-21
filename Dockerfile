@@ -4,9 +4,8 @@
 FROM rust:1.91-slim-bookworm AS build
 ARG TARGETARCH
 WORKDIR /src
-# x86-64-v3 (AVX2, BMI2) holds on every scorer; never target-cpu=native, the build
-# host is not the run host.
-RUN if [ "$TARGETARCH" = "arm64" ]; then echo "" > /rustflags; else echo "-C target-cpu=x86-64-v3" > /rustflags; fi
+# Tune the amd64 binary for the scorer independently of the build host.
+RUN if [ "$TARGETARCH" = "arm64" ]; then echo "" > /rustflags; else echo "-C target-cpu=cascadelake" > /rustflags; fi
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN RUSTFLAGS="$(cat /rustflags)" cargo build --release --locked
