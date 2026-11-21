@@ -344,7 +344,7 @@ fn main() {
         for _ in 0..3 {
             let t = Instant::now();
             let mut c = 0u64;
-            scan::lines::<7, _>(&buf, data.len(), |r| c += r.len(2) as u64);
+            scan::events(&buf, data.len(), |r| c += r.len(2) as u64);
             let el = t.elapsed().as_secs_f64();
             eprintln!("scan {:.3}s {:.2} GB/s ({c})", el, data.len() as f64 / el / 1e9);
         }
@@ -413,13 +413,11 @@ fn run<R: Rec>(c: &Ctx) -> ! {
     // ---- 1. parse, while one more thread joins the links into people ----
     let events = Input::open(&data.join("events"), 8 << 20);
     let clicks = Input::open(&data.join("clicks"), 8 << 20);
-    // Bucket counts from the input size (an event line is about 75 bytes): about 64K
-    // events per bucket, which keeps the per-bucket tables near cache size while the
-    // parse scatters into few enough streams (hundreds, not thousands) that its writes
-    // stay within the TLB.
+    // Estimate 75 bytes per event. Smaller event-ID buckets keep dedup tables
+    // cache-sized. Larger person buckets reduce spare capacity in the scatter vectors.
     let est = (events.bytes / 75) as usize;
     let nbe = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
-    let nb = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
+    let nb = (est / 262_144).next_power_of_two().clamp(threads * 4, 4096);
     let nev = events.chunks.len();
     // Click chunks come after every event chunk has started, by which time the people
     // are usually joined; a click chunk waits for them if not.
@@ -441,7 +439,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                 if i < nev {
                     let n = events.read(i, &mut st.buf);
                     let Parse { buf, ev, .. } = st;
-                    scan::lines::<7, _>(buf, n, |f| {
+                    scan::events(buf, n, |f| {
                         if f.len(0) == 0 {
                             return;
                         }
@@ -507,7 +505,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
     // buckets grow as they fill instead of being reserved up front, so the allocator
     // can hand them the memory the parts leave behind.
     let raws: Vec<Vec<std::sync::Mutex<Vec<Raw<R>>>>> =
-        parsed.iter_mut().map(|p| std::mem::take(&mut p.ev).into_iter().map(std::sync::Mutex::new).collect()).collect();
+        parsed.into_iter().map(|p| p.ev.into_iter().map(std::sync::Mutex::new).collect()).collect();
     let (_, deduped) = par::run(
         nbe,
         threads,
@@ -532,24 +530,30 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             kept.clear();
             ingest.clear();
             let ev = |r: &Raw<R>| Ev { person: r.uid, t: r.t, pc: r.pc };
-            for r in parts.iter().flatten() {
-                let mut s = (r.eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
-                loop {
-                    let (k, i) = slots[s];
-                    if k == u64::MAX {
-                        slots[s] = (r.eid, kept.len() as u32);
-                        kept.push(ev(r));
-                        ingest.push(r.ingest);
-                        break;
+            let slot = |eid: u64| (eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
+            for part in &parts {
+                for (j, r) in part.iter().enumerate() {
+                    if let Some(a) = part.get(j + 8) {
+                        par::prefetch(&slots[slot(a.eid)]);
                     }
-                    if k == r.eid {
-                        if r.ingest < ingest[i as usize] {
-                            kept[i as usize] = ev(r);
-                            ingest[i as usize] = r.ingest;
+                    let mut s = slot(r.eid);
+                    loop {
+                        let (k, i) = slots[s];
+                        if k == u64::MAX {
+                            slots[s] = (r.eid, kept.len() as u32);
+                            kept.push(ev(r));
+                            ingest.push(r.ingest);
+                            break;
                         }
-                        break;
+                        if k == r.eid {
+                            if r.ingest < ingest[i as usize] {
+                                kept[i as usize] = ev(r);
+                                ingest[i as usize] = r.ingest;
+                            }
+                            break;
+                        }
+                        s = (s + 1) & mask;
                     }
-                    s = (s + 1) & mask;
                 }
             }
             drop(parts);
@@ -564,7 +568,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             }
         },
     );
-    drop(parsed);
+    let deduped: Vec<_> = deduped.into_iter().map(|worker| worker.ev).collect();
     lap("dedup");
 
     // ---- 3. sessions, credit, assists ----
@@ -581,11 +585,11 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             // densely, counting-sort events and clicks by that number straight out of the
             // parts, then sort each person's own run by time. Clicks of people with no
             // surviving event credit nothing and are skipped.
-            let n_ev: usize = deduped.iter().map(|d| d.ev[b].len()).sum();
+            let n_ev: usize = deduped.iter().map(|d| d[b].len()).sum();
             let mut ids = Dense::new(n_ev / 16);
             let mut pid: Vec<u32> = Vec::with_capacity(n_ev);
             for d in &deduped {
-                pid.extend(d.ev[b].iter().map(|e| ids.id(e.person)));
+                pid.extend(d[b].iter().map(|e| ids.id(e.person)));
             }
             let np = ids.keys.len();
             let mut eoff = vec![0u32; np + 1];
@@ -599,7 +603,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             {
                 let mut at = eoff.clone();
                 let out = ev.spare_capacity_mut();
-                for (e, &x) in deduped.iter().flat_map(|d| d.ev[b].iter()).zip(&pid) {
+                for (e, &x) in deduped.iter().flat_map(|d| d[b].iter()).zip(&pid) {
                     out[at[x as usize] as usize].write(*e);
                     at[x as usize] += 1;
                 }

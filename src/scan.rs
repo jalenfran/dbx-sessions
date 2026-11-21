@@ -214,6 +214,103 @@ pub fn lines<'a, const N: usize, F: FnMut(&Row<'a, N>)>(buf: &'a [u8], len: usiz
     }
 }
 
+/// Scan event rows directly from delimiter masks. Rows longer than two blocks
+/// use scalar field splitting. Input has the same zero-padding contract as `lines`.
+#[inline(always)]
+pub fn events<'a>(buf: &'a [u8], len: usize, mut visit: impl FnMut(&Row<'a, 7>)) {
+    assert!(len < u32::MAX as usize - 1 && buf.len() - len >= SLACK);
+    let mut start = 0;
+    while start < len {
+        let first = masks(buf[start..start + BLOCK].try_into().unwrap());
+        // Decode the first three fields from one block. Start the second block at
+        // ingest_ts so the remaining four fields usually fit even on quoted rows.
+        let mut head = first.comma;
+        let mut ends = [0usize; 7];
+        for e in &mut ends[..3] {
+            *e = head.trailing_zeros() as usize;
+            head &= head.wrapping_sub(1);
+        }
+        let cut = ends[2] + 1;
+        if cut <= first.nl.trailing_zeros() as usize && cut <= len - start {
+            let at = start + cut;
+            let last = masks(buf[at..at + BLOCK].try_into().unwrap());
+            let nl = last.nl.trailing_zeros() as usize;
+            let before = (1u64 << (nl & 63)).wrapping_sub(1);
+            let mut tail = last.comma & before;
+            if nl < BLOCK && tail.count_ones() == 3 {
+                for e in &mut ends[3..6] {
+                    *e = cut + tail.trailing_zeros() as usize;
+                    tail &= tail - 1;
+                }
+                ends[6] = cut + nl;
+                let mut row = Row { buf, spans: [(0, 0); 7] };
+                let mut s = start;
+                let mut wrapped = 0;
+                for (span, end) in row.spans.iter_mut().zip(ends) {
+                    let e = start + end;
+                    let w = ((e >= s + 2) & (buf[s] == b'"') & (buf[e.saturating_sub(1)] == b'"')) as usize;
+                    *span = ((s + w) as u32, (e - w) as u32);
+                    wrapped += w as u32;
+                    s = e + 1;
+                }
+                let first_quotes = first.quote & (u64::MAX >> (64 - cut));
+                if first_quotes.count_ones() + (last.quote & before).count_ones() == 2 * wrapped {
+                    visit(&row);
+                }
+                start = s;
+                continue;
+            }
+        }
+        let mut commas = first.comma as u128;
+        let mut quotes = first.quote as u128;
+        let mut end = first.nl.trailing_zeros() as usize;
+        if first.nl == 0 && len - start > BLOCK {
+            let at = start + BLOCK;
+            let second = masks(buf[at..at + BLOCK].try_into().unwrap());
+            commas |= (second.comma as u128) << BLOCK;
+            quotes |= (second.quote as u128) << BLOCK;
+            end += second.nl.trailing_zeros() as usize;
+        }
+        end = end.min(len - start);
+        if end == 128 {
+            let tail = &buf[start + end..len];
+            end += tail.iter().position(|&c| c == b'\n').unwrap_or(tail.len());
+            let line = &buf[start..start + end];
+            let mut row = Row { buf, spans: [(0, 0); 7] };
+            let mut fields = line.split(|&c| c == b',');
+            let mut s = start;
+            let valid = row.spans.iter_mut().all(|span| {
+                let Some(field) = fields.next() else { return false };
+                let e = s + field.len();
+                let wrapped = field.len() >= 2 && field.starts_with(b"\"") && field.ends_with(b"\"");
+                let w = usize::from(wrapped);
+                *span = ((s + w) as u32, (e - w) as u32);
+                s = e + 1;
+                !field[w..field.len() - w].contains(&b'"')
+            });
+            if valid && fields.next().is_none() { visit(&row); }
+        } else {
+            let before = (1u128 << end) - 1;
+            commas &= before;
+            if commas.count_ones() == 6 {
+                let mut row = Row { buf, spans: [(0, 0); 7] };
+                let mut s = start;
+                let mut wrapped = 0;
+                for (i, span) in row.spans.iter_mut().enumerate() {
+                    let e = start + if i == 6 { end } else { commas.trailing_zeros() as usize };
+                    commas &= commas.wrapping_sub(1);
+                    let w = ((e >= s + 2) & (buf[s] == b'"') & (buf[e.saturating_sub(1)] == b'"')) as usize;
+                    *span = ((s + w) as u32, (e - w) as u32);
+                    wrapped += w as u32;
+                    s = e + 1;
+                }
+                if (quotes & before).count_ones() == 2 * wrapped { visit(&row); }
+            }
+        }
+        start += end + 1;
+    }
+}
+
 /// `data` copied into a zero-padded buffer that `lines` accepts.
 pub fn padded(data: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(data.len().div_ceil(BLOCK) * BLOCK + SLACK);
@@ -271,6 +368,29 @@ mod tests {
         let mut out = Vec::new();
         lines::<N, _>(&buf, data.len(), |r| out.push((0..N).map(|i| r.get(i).to_vec()).collect()));
         out
+    }
+
+    #[test]
+    fn event_rows_match_reference_at_block_boundaries() {
+        let mut data = Vec::new();
+        for n in 0..=150 {
+            for col in 0..7 {
+                for field in [b"a".as_slice(), b"\"\"", b"b\"c", b"", b"\r"] {
+                    for k in 0..7 {
+                        if k != 0 { data.push(b','); }
+                        if k == col { data.extend(std::iter::repeat_n(b'x', n)); }
+                        data.extend_from_slice(field);
+                    }
+                    data.push(b'\n');
+                }
+            }
+            data.extend_from_slice(b"bad,line\n,,,,,,extra,field\n");
+        }
+        data.extend_from_slice(b"a,b,c,d,e,f,\"g\"");
+        let buf = padded(&data);
+        let mut actual = Vec::new();
+        events(&buf, data.len(), |r| actual.push((0..7).map(|i| r.get(i).to_vec()).collect::<Vec<_>>()));
+        assert_eq!(actual, reference::<7>(&data));
     }
 
     #[test]
