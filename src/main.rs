@@ -412,11 +412,12 @@ fn run<R: Rec>(c: &Ctx) -> ! {
     // ---- 1. parse, while one more thread joins the links into people ----
     let events = Input::open(&data.join("events"), 8 << 20);
     let clicks = Input::open(&data.join("clicks"), 8 << 20);
-    // Bucket counts from the input size (an event line is about 75 bytes), so the
-    // per-bucket tables stay cache sized however many threads there are: about 16K
-    // events per event_id bucket, 64K per person bucket.
+    // Bucket counts from the input size (an event line is about 75 bytes): about 64K
+    // events per bucket, which keeps the per-bucket tables near cache size while the
+    // parse scatters into few enough streams (hundreds, not thousands) that its writes
+    // stay within the TLB.
     let est = (events.bytes / 75) as usize;
-    let nbe = (est / 16_384).next_power_of_two().clamp(threads * 4, 4096);
+    let nbe = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
     let nb = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
     let nev = events.chunks.len();
     let (persons, parsed) = std::thread::scope(|sc| {
