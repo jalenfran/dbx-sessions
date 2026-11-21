@@ -1,0 +1,19 @@
+[package]
+name = "sessions"
+version = "0.1.0"
+edition = "2024"
+
+# No dependencies: the CSV scanner, timestamp parser, hash tables and Parquet writer are all in src/.
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

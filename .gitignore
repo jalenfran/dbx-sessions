@@ -1,0 +1,11 @@
+/target
+/data
+/dev
+/dev-answer
+/out
+/.venv
+/lean/.lake
+*.parquet
+*.zip
+perf.data*
+__pycache__/

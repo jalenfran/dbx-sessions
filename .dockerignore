@@ -1,0 +1,10 @@
+target
+data
+dev
+dev-answer
+out*
+fixtures
+lean
+.venv
+.git
+*.zip
