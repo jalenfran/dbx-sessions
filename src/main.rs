@@ -241,7 +241,8 @@ fn manifest_ts(json: &str, key: &str) -> i64 {
 /// Union-find over link endpoints; returns uid -> person name for every linked ID
 /// whose name is not itself (anything not in the table is its own person).
 fn people(keys: &Keys, pairs: &[(u64, u64)]) -> Table<u64> {
-    let mut node: Table<u32> = Table::new(pairs.len() * 2);
+    // At most 2 * pairs IDs, and `Table::new(n)` has room for 2 * n.
+    let mut node: Table<u32> = Table::new(pairs.len());
     let mut key_of: Vec<u64> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -293,15 +294,15 @@ fn people(keys: &Keys, pairs: &[(u64, u64)]) -> Table<u64> {
 struct Parse<R: Rec> {
     buf: Vec<u8>,
     ev: Vec<Vec<Raw<R>>>,
-    /// Valid clicks under their user_id; the person comes in stage 2.
-    ck: Vec<Click<R>>,
+    /// Valid clicks by person bucket, and one chunk's clicks under their user_id.
+    ck: Vec<Vec<Click<R>>>,
+    pend: Vec<Click<R>>,
 }
 
-/// Stage 2, per thread: person buckets of events and of clicks, and the dedup scratch,
-/// reused across event_id buckets so its tables are not faulted in afresh each time.
+/// Stage 2, per thread: person buckets of events, and the dedup scratch, reused
+/// across event_id buckets so its tables are not faulted in afresh each time.
 struct Dedup<R: Rec> {
     ev: Vec<Vec<Ev<R>>>,
-    ck: Vec<Vec<Click<R>>>,
     slots: Vec<(u64, u32)>,
     kept: Vec<Ev<R>>,
     ingest: Vec<i64>,
@@ -420,16 +421,21 @@ fn run<R: Rec>(c: &Ctx) -> ! {
     let nbe = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
     let nb = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
     let nev = events.chunks.len();
-    let (persons, parsed) = std::thread::scope(|sc| {
-        let people = sc.spawn(|| people(&keys, &pairs));
-        let (_, parsed) = par::run(
+    // Click chunks come after every event chunk has started, by which time the people
+    // are usually joined; a click chunk waits for them if not.
+    let joined: std::sync::OnceLock<Table<u64>> = std::sync::OnceLock::new();
+    const AHEAD: usize = 16;
+    let mut parsed = std::thread::scope(|sc| {
+        sc.spawn(|| joined.set(people(&keys, &pairs)).ok());
+        par::run(
             nev + clicks.chunks.len(),
             threads,
             // Buckets reserved at a little over their expected share, so most never regrow.
             || Parse {
                 buf: Vec::new(),
                 ev: (0..nbe).map(|_| Vec::with_capacity(est / threads / nbe * 5 / 4)).collect(),
-                ck: Vec::with_capacity((clicks.bytes / 45) as usize / threads * 5 / 4),
+                ck: (0..nb).map(|_| Vec::with_capacity((clicks.bytes / 45) as usize / threads / nb * 5 / 4)).collect(),
+                pend: Vec::new(),
             },
             |st, i| {
                 if i < nev {
@@ -439,7 +445,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                         if f.len(0) == 0 {
                             return;
                         }
-                        let mut r = Raw { eid: keys.field(f, 0), ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX), uid: 0, t: R::t(0), pc: R::BAD };
+                        let mut r = Raw { eid: keys.field(f, 0), ingest: ts::parse_f1(f.get(3)).unwrap_or(i64::MAX), uid: 0, t: R::t(0), pc: R::BAD };
                         let kind = match f.get(4) {
                             b"view" => Some(0),
                             b"cart" => Some(1),
@@ -464,7 +470,8 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                     });
                 } else {
                     let n = clicks.read(i - nev, &mut st.buf);
-                    let Parse { buf, ck, .. } = st;
+                    let Parse { buf, ck, pend, .. } = st;
+                    pend.clear();
                     scan::lines::<4, _>(buf, n, |f| {
                         if f.len(0) == 0 || f.len(1) == 0 {
                             return;
@@ -474,49 +481,46 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                             return;
                         }
                         let Some(camp) = campaigns.field(f, 2) else { return };
-                        ck.push(Click { person: keys.field(f, 1), cid: keys.field(f, 0), t: R::t(t - base), camp });
+                        pend.push(Click { person: keys.field(f, 1), cid: keys.field(f, 0), t: R::t(t - base), camp });
                     });
+                    let persons = joined.wait();
+                    for i in 0..pend.len() {
+                        if i + AHEAD < pend.len() {
+                            persons.prefetch(pend[i + AHEAD].person);
+                        }
+                        let mut c = pend[i];
+                        c.person = persons.get(c.person).unwrap_or(c.person);
+                        ck[bucket(c.person, nb)].push(c);
+                    }
                 }
             },
-        );
-        (people.join().unwrap(), parsed)
+        )
+        .1
     });
+    let persons = joined.into_inner().expect("people");
     let person = |uid: u64| persons.get(uid).unwrap_or(uid);
+    let clicks_by: Vec<Vec<Vec<Click<R>>>> = parsed.iter_mut().map(|p| std::mem::take(&mut p.ck)).collect();
     lap("parse");
 
-    // ---- 2. dedup on event_id, then person lookup and scatter by person; and the
-    // clicks' person lookup and scatter, in pieces after the event_id buckets ----
-    const PIECE: usize = 1 << 16;
-    let pieces: Vec<(usize, usize)> =
-        parsed.iter().enumerate().flat_map(|(t, p)| (0..p.ck.len()).step_by(PIECE).map(move |s| (t, s))).collect();
-    const AHEAD: usize = 16;
-    let nck: usize = parsed.iter().map(|p| p.ck.len()).sum();
+    // ---- 2. dedup on event_id, then person lookup and scatter by person ----
+    // Each event_id bucket's parts are taken out and freed once deduped, and the person
+    // buckets grow as they fill instead of being reserved up front, so the allocator
+    // can hand them the memory the parts leave behind.
+    let raws: Vec<Vec<std::sync::Mutex<Vec<Raw<R>>>>> =
+        parsed.iter_mut().map(|p| std::mem::take(&mut p.ev).into_iter().map(std::sync::Mutex::new).collect()).collect();
     let (_, deduped) = par::run(
-        nbe + pieces.len(),
+        nbe,
         threads,
         || Dedup {
-            ev: (0..nb).map(|_| Vec::with_capacity(est / threads / nb * 5 / 4)).collect(),
-            ck: (0..nb).map(|_| Vec::with_capacity(nck / threads / nb * 5 / 4)).collect(),
+            ev: (0..nb).map(|_| Vec::new()).collect(),
             slots: Vec::new(),
             kept: Vec::new(),
             ingest: Vec::new(),
         },
         |st, b| {
-            if b >= nbe {
-                let (t, s) = pieces[b - nbe];
-                let cs = &parsed[t].ck[s..(s + PIECE).min(parsed[t].ck.len())];
-                for i in 0..cs.len() {
-                    if i + AHEAD < cs.len() {
-                        persons.prefetch(cs[i + AHEAD].person);
-                    }
-                    let mut c = cs[i];
-                    c.person = person(c.person);
-                    st.ck[bucket(c.person, nb)].push(c);
-                }
-                return;
-            }
             let Dedup { ev: outb, slots, kept, ingest, .. } = st;
-            let n: usize = parsed.iter().map(|p| p.ev[b].len()).sum();
+            let parts: Vec<Vec<Raw<R>>> = raws.iter().map(|t| std::mem::take(&mut *t[b].lock().unwrap())).collect();
+            let n: usize = parts.iter().map(|p| p.len()).sum();
             let cap = (n * 2).next_power_of_two().max(16);
             let shift = 64 - cap.trailing_zeros();
             let mask = cap - 1;
@@ -528,7 +532,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             kept.clear();
             ingest.clear();
             let ev = |r: &Raw<R>| Ev { person: r.uid, t: r.t, pc: r.pc };
-            for r in parsed.iter().flat_map(|p| p.ev[b].iter()) {
+            for r in parts.iter().flatten() {
                 let mut s = (r.eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
                 loop {
                     let (k, i) = slots[s];
@@ -548,6 +552,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                     s = (s + 1) & mask;
                 }
             }
+            drop(parts);
             kept.retain(|e| e.pc != R::BAD);
             for i in 0..kept.len() {
                 if i + AHEAD < kept.len() {
@@ -602,9 +607,9 @@ fn run<R: Rec>(c: &Ctx) -> ! {
                 unsafe { ev.set_len(n_ev) };
             }
             drop(pid);
-            let mut cid_of: Vec<u32> = Vec::with_capacity(deduped.iter().map(|p| p.ck[b].len()).sum());
-            for p in &deduped {
-                cid_of.extend(p.ck[b].iter().map(|c| ids.get(c.person).unwrap_or(u32::MAX)));
+            let mut cid_of: Vec<u32> = Vec::with_capacity(clicks_by.iter().map(|p| p[b].len()).sum());
+            for p in &clicks_by {
+                cid_of.extend(p[b].iter().map(|c| ids.get(c.person).unwrap_or(u32::MAX)));
             }
             let mut coff = vec![0u32; np + 1];
             for &x in &cid_of {
@@ -620,7 +625,7 @@ fn run<R: Rec>(c: &Ctx) -> ! {
             {
                 let mut at = coff.clone();
                 let out = ck.spare_capacity_mut();
-                for (c, &x) in deduped.iter().flat_map(|p| p.ck[b].iter()).zip(&cid_of) {
+                for (c, &x) in clicks_by.iter().flat_map(|p| p[b].iter()).zip(&cid_of) {
                     if x != u32::MAX {
                         out[at[x as usize] as usize].write(*c);
                         at[x as usize] += 1;

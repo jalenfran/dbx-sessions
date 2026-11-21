@@ -34,6 +34,26 @@ pub fn parse(s: &[u8]) -> Option<i64> {
     }
 }
 
+/// `parse` for a field that is almost always F1 (`ingest_ts`): the F1 checks inline,
+/// anything else through `parse`.
+#[inline(always)]
+pub fn parse_f1(s: &[u8]) -> Option<i64> {
+    if s.len() != 20 {
+        return parse(s);
+    }
+    let (w0, w1, wc) = (word(s, 0), word(s, 8), word(s, 12));
+    if !(check(w0, T_DATE, D_DATE, 0) & check(w1, T_DAY, D_DAY, 0) & check(wc, T_F1, D_F1, 0)) {
+        return parse(s);
+    }
+    let (p0, p1, pc) = (pairs(w0, T_DATE, D_DATE), pairs(w1, T_DAY, D_DAY), pairs(wc, T_F1, D_F1));
+    let (y, mo, d) = (at(p0, 1) * 100 + at(p0, 3), at(p0, 6), at(p1, 1));
+    let (h, mi, se) = (at(p1, 4), at(p1, 7), at(pc, 6));
+    if !(1..=12).contains(&mo) || d == 0 || d > month_days(y, mo) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    Some(days(y, mo, d) * DAY + h * HOUR + mi * MIN + se * SEC)
+}
+
 /// Eight ASCII digits, most significant first in a little-endian word, or None.
 /// lean/Sessions/Epoch.lean proves both halves for every word: `digits8` accepts exactly
 /// the words of 8 digits, and `value8` then equals their decimal value.
@@ -264,6 +284,27 @@ mod tests {
                     assert_eq!(days(y, m, d), days_from_civil(y, m, d), "{y}-{m}-{d}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn f1_matches_parse() {
+        let alphabet = b"0123456789-:TZtz+ /9";
+        let mut r: u64 = 3;
+        let mut next = || {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            r >> 33
+        };
+        for _ in 0..2_000_000 {
+            let mut v = b"2026-10-03T23:58:10Z".to_vec();
+            for _ in 0..next() % 3 {
+                let i = next() as usize % v.len();
+                v[i] = if next() % 2 == 0 { alphabet[next() as usize % alphabet.len()] } else { b'0' + (next() % 10) as u8 };
+            }
+            if next() % 5 == 0 {
+                v.truncate(next() as usize % 21);
+            }
+            assert_eq!(parse_f1(&v), parse(&v), "{:?}", String::from_utf8_lossy(&v));
         }
     }
 
