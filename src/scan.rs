@@ -144,7 +144,10 @@ pub fn lines<'a, const N: usize, F: FnMut(&Row<'a, N>)>(buf: &'a [u8], len: usiz
             let mut wrapped = 0u32;
             for k in 0..N {
                 let e = pos[*j + k];
-                let w = e >= s + 2 && buf[s as usize] == b'"' && buf[e as usize - 1] == b'"';
+                // Branch-free: fields are quoted at random, so `&&` would mispredict.
+                // s <= e < buf.len(), and e - 1 is only read when e >= 1.
+                let (a, z) = unsafe { (*buf.get_unchecked(s as usize), *buf.get_unchecked((e.max(1) - 1) as usize)) };
+                let w = (e >= s + 2) & (a == b'"') & (z == b'"');
                 wrapped += w as u32;
                 row.spans[k] = (s + w as u32, e - w as u32);
                 s = e + 1;

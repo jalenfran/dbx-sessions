@@ -188,17 +188,90 @@ impl<V: Copy + Default> Table<V> {
     }
 }
 
-/// Exact lookup for the small clean tables (products, campaigns) without allocating:
-/// packed keys in a `Table`, unpackable ones by their bytes.
+/// Keys numbered 0, 1, 2, .. in first-seen order: open addressing that grows, so it
+/// stays as small as the number of distinct keys.
+pub struct Dense {
+    slots: Vec<(u64, u32)>,
+    shift: u32,
+    pub keys: Vec<u64>,
+}
+
+impl Dense {
+    pub fn new(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(64);
+        Dense { slots: vec![(u64::MAX, 0); cap], shift: 64 - cap.trailing_zeros(), keys: Vec::with_capacity(n) }
+    }
+
+    #[inline(always)]
+    fn find(&self, k: u64) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut i = (k.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize;
+        while self.slots[i].0 != k && self.slots[i].0 != u64::MAX {
+            i = (i + 1) & mask;
+        }
+        i
+    }
+
+    #[inline(always)]
+    pub fn id(&mut self, k: u64) -> u32 {
+        let i = self.find(k);
+        if self.slots[i].0 == k {
+            return self.slots[i].1;
+        }
+        let n = self.keys.len() as u32;
+        self.slots[i] = (k, n);
+        self.keys.push(k);
+        if self.keys.len() * 2 > self.slots.len() {
+            let cap = self.slots.len() * 2;
+            *self = Dense { slots: vec![(u64::MAX, 0); cap], shift: 64 - cap.trailing_zeros(), keys: std::mem::take(&mut self.keys) };
+            for (j, &k) in self.keys.iter().enumerate() {
+                let i = self.find(k);
+                self.slots[i] = (k, j as u32);
+            }
+        }
+        n
+    }
+
+    #[inline(always)]
+    pub fn get(&self, k: u64) -> Option<u32> {
+        let s = self.slots[self.find(k)];
+        (s.0 == k).then_some(s.1)
+    }
+}
+
+/// Exact lookup for the small clean tables (products, campaigns) without allocating.
+/// IDs of the form `prefix` + a canonical decimal below `NUM_LIMIT` (no leading zero,
+/// at most 7 digits), `prefix` taken from the first row, are numbered: their value
+/// indexes `num` directly, a small array instead of a hash probe. Every other ID is
+/// in `packed` or, if it does not pack, `other`. Which side an ID belongs to depends
+/// on its bytes alone, so a lookup only ever searches the side its key would be on,
+/// and `number` is injective (lean/Sessions/Lookup.lean, `number_inj`), so no two IDs
+/// share a slot.
 pub struct Lookup<V: Copy + Default> {
+    prefix: Vec<u8>,
+    num: Vec<Option<V>>,
     packed: Table<V>,
     other: HashMap<Vec<u8>, V>,
 }
 
+const NUM_LIMIT: u32 = 1 << 22;
+
 impl<V: Copy + Default> Lookup<V> {
     pub fn new(rows: &[(&[u8], V)]) -> Self {
-        let mut l = Lookup { packed: Table::new(rows.len()), other: HashMap::new() };
+        let prefix = rows.first().map_or(&b""[..], |r| {
+            let d = r.0.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+            &r.0[..r.0.len() - d]
+        });
+        let mut l = Lookup { prefix: prefix.to_vec(), num: Vec::new(), packed: Table::new(rows.len()), other: HashMap::new() };
         for &(b, v) in rows {
+            if let Some(n) = l.number(b) {
+                let n = n as usize;
+                if l.num.len() <= n {
+                    l.num.resize(n + 1, None);
+                }
+                l.num[n] = Some(v);
+                continue;
+            }
             match pack(b) {
                 Some(k) => l.packed.insert(k, v),
                 None => {
@@ -209,8 +282,30 @@ impl<V: Copy + Default> Lookup<V> {
         l
     }
 
+    /// The number of a numbered ID, None for any other.
+    #[inline(always)]
+    fn number(&self, b: &[u8]) -> Option<u32> {
+        let p = self.prefix.len();
+        let d = b.get(p..)?;
+        if d.is_empty() || d.len() > 7 || (d[0] == b'0' && d.len() > 1) || b[..p] != self.prefix[..] {
+            return None;
+        }
+        let mut v = 0u32;
+        for &c in d {
+            let x = c.wrapping_sub(b'0');
+            if x >= 10 {
+                return None;
+            }
+            v = v * 10 + x as u32;
+        }
+        (v < NUM_LIMIT).then_some(v)
+    }
+
     #[inline(always)]
     pub fn field<const N: usize>(&self, row: &Row<N>, i: usize) -> Option<V> {
+        if let Some(n) = self.number(row.get(i)) {
+            return self.num.get(n as usize).copied().flatten();
+        }
         match row.pack(i) {
             Some(k) => self.packed.get(k),
             None => self.other.get(row.get(i)).copied(),
@@ -259,6 +354,40 @@ mod tests {
             }
             let w = u64::from_be_bytes(buf[..8].try_into().unwrap());
             assert_eq!(pack_word(w, buf[8], len), pack(&buf[..len]), "{:?}", &buf[..len]);
+        }
+    }
+
+    #[test]
+    fn lookup_matches_hashmap() {
+        let mut r: u64 = 7;
+        let mut next = || {
+            r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            r >> 33
+        };
+        let alphabet = b"p0123456789_q";
+        let mut ids: Vec<Vec<u8>> = vec![b"p".to_vec(), b"p0".to_vec(), b"p00".to_vec(), b"p01".to_vec(), b"".to_vec()];
+        for _ in 0..20_000 {
+            let len = next() as usize % 10;
+            let mut id = if next() % 4 != 0 { b"p".to_vec() } else { Vec::new() };
+            id.extend((0..len).map(|_| alphabet[next() as usize % alphabet.len()]));
+            ids.push(id);
+        }
+        let (table, probes) = ids.split_at(ids.len() / 2);
+        let mut table = table.to_vec();
+        table.sort();
+        table.dedup();
+        let rows: Vec<(&[u8], u32)> = table.iter().enumerate().map(|(i, b)| (&b[..], i as u32)).collect();
+        let want: HashMap<&[u8], u32> = rows.iter().copied().collect();
+        let l = Lookup::new(&rows);
+        for id in table.iter().chain(probes) {
+            let mut buf = id.clone();
+            buf.extend_from_slice(b",x\n");
+            let buf = crate::scan::padded(&buf);
+            let mut got = None;
+            crate::scan::lines::<2, _>(&buf, id.len() + 3, |row| got = Some(l.field(row, 0)));
+            if let Some(got) = got {
+                assert_eq!(got, want.get(&id[..]).copied(), "{:?}", String::from_utf8_lossy(id));
+            }
         }
     }
 

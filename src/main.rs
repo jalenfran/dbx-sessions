@@ -21,7 +21,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use key::{Keys, Lookup, Table};
+use key::{Dense, Keys, Lookup, Table};
 use parquet::{Column, Values};
 use ts::DAY;
 
@@ -30,6 +30,8 @@ const REACH: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 
 const PURCHASE: u8 = 2;
+/// `Ev::kind` of a kept copy that failed validation.
+const NOT_OK: u8 = u8::MAX;
 
 /// An event copy as parsed. `ok` is the result of validation (rules 3 and 4), done
 /// up front; the copy still competes in dedup (rule 2) when it is not ok.
@@ -98,6 +100,7 @@ fn csv_files(dir: &Path) -> Vec<PathBuf> {
 struct Input {
     files: Vec<File>,
     chunks: Vec<(u32, u64, u64)>,
+    bytes: u64,
 }
 
 impl Input {
@@ -115,7 +118,8 @@ impl Input {
         }
         // Biggest first, so the last tasks to start are short.
         chunks.sort_by_key(|c| std::cmp::Reverse(c.2 - c.1));
-        Input { files, chunks }
+        let bytes = chunks.iter().map(|c| c.2 - c.1).sum();
+        Input { files, chunks, bytes }
     }
 
     /// Reads chunk `i` into `buf`, zero padded for `scan::lines`; returns its length.
@@ -226,7 +230,18 @@ fn people(keys: &Keys, pairs: &[(u64, u64)]) -> Table<u64> {
 struct Parse {
     buf: Vec<u8>,
     ev: Vec<Vec<Raw>>,
+    /// Valid clicks under their user_id; the person comes in stage 2.
+    ck: Vec<Click>,
+}
+
+/// Stage 2, per thread: person buckets of events and of clicks, and the dedup scratch,
+/// reused across event_id buckets so its tables are not faulted in afresh each time.
+struct Dedup {
+    ev: Vec<Vec<Ev>>,
     ck: Vec<Vec<Click>>,
+    slots: Vec<(u64, u32)>,
+    kept: Vec<Ev>,
+    ingest: Vec<i64>,
 }
 
 fn main() {
@@ -247,7 +262,7 @@ fn main() {
     let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let data = PathBuf::from(env("DATA_DIR", "/data"));
     let out = PathBuf::from(env("OUTPUT_DIR", "/output"));
-    let threads: usize = env("NCPU", "8").parse().unwrap_or(8).max(1);
+    let threads: usize = env("NCPU", "8").parse().unwrap_or(8).clamp(1, 256);
 
     // ---- 0. small tables ----
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
@@ -289,127 +304,159 @@ fn main() {
     )
     .0
     .concat();
-    let persons = people(&keys, &pairs);
-    let person = |uid: u64| persons.get(uid).unwrap_or(uid);
     lap("links");
 
-    // ---- 1. parse ----
-    let nb = (threads * 32).next_power_of_two();
+    // ---- 1. parse, while one more thread joins the links into people ----
     let events = Input::open(&data.join("events"), 8 << 20);
     let clicks = Input::open(&data.join("clicks"), 8 << 20);
+    // Bucket counts from the input size (an event line is about 75 bytes), so the
+    // per-bucket tables stay cache sized however many threads there are: about 16K
+    // events per event_id bucket, 64K per person bucket.
+    let est = (events.bytes / 75) as usize;
+    let nbe = (est / 16_384).next_power_of_two().clamp(threads * 4, 4096);
+    let nb = (est / 65_536).next_power_of_two().clamp(threads * 4, 4096);
     let nev = events.chunks.len();
-    let (_, parsed) = par::run(
-        nev + clicks.chunks.len(),
-        threads,
-        || Parse { buf: Vec::new(), ev: (0..nb).map(|_| Vec::new()).collect(), ck: (0..nb).map(|_| Vec::new()).collect() },
-        |st, i| {
-            if i < nev {
-                let n = events.read(i, &mut st.buf);
-                let Parse { buf, ev, .. } = st;
-                scan::lines::<7, _>(buf, n, |f| {
-                    if f.len(0) == 0 {
-                        return;
-                    }
-                    let mut r = Raw {
-                        eid: keys.field(f, 0),
-                        ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX),
-                        uid: 0,
-                        ts: 0,
-                        price: 0,
-                        cat: 0,
-                        kind: 0,
-                        ok: false,
-                    };
-                    let kind = match f.get(4) {
-                        b"view" => Some(0),
-                        b"cart" => Some(1),
-                        b"purchase" => Some(PURCHASE),
-                        _ => None,
-                    };
-                    if let (Some(t), Some(kind)) = (ts::parse(f.get(2)), kind)
-                        && t >= ws
-                        && t < we
-                        && f.len(1) != 0
-                        && f.len(5) != 0
-                        && r.ingest.saturating_sub(t) <= LATE
-                    {
-                        let p = if kind == PURCHASE { price(f.get(6)) } else { Some(0) };
-                        if let Some(p) = p {
-                            r.ok = true;
-                            r.ts = t;
-                            r.kind = kind;
-                            r.price = p;
-                            r.uid = keys.field(f, 1);
-                            r.cat = products.field(f, 5).unwrap_or(unknown);
+    let (persons, parsed) = std::thread::scope(|sc| {
+        let people = sc.spawn(|| people(&keys, &pairs));
+        let (_, parsed) = par::run(
+            nev + clicks.chunks.len(),
+            threads,
+            // Buckets reserved at a little over their expected share, so most never regrow.
+            || Parse {
+                buf: Vec::new(),
+                ev: (0..nbe).map(|_| Vec::with_capacity(est / threads / nbe * 5 / 4)).collect(),
+                ck: Vec::with_capacity((clicks.bytes / 45) as usize / threads * 5 / 4),
+            },
+            |st, i| {
+                if i < nev {
+                    let n = events.read(i, &mut st.buf);
+                    let Parse { buf, ev, .. } = st;
+                    scan::lines::<7, _>(buf, n, |f| {
+                        if f.len(0) == 0 {
+                            return;
                         }
-                    }
-                    ev[bucket(r.eid, nb)].push(r);
-                });
-            } else {
-                let n = clicks.read(i - nev, &mut st.buf);
-                let Parse { buf, ck, .. } = st;
-                scan::lines::<4, _>(buf, n, |f| {
-                    if f.len(0) == 0 || f.len(1) == 0 {
-                        return;
-                    }
-                    let Some(t) = ts::parse(f.get(3)) else { return };
-                    if t < ws - REACH || t >= we {
-                        return;
-                    }
-                    let Some(camp) = campaigns.field(f, 2) else { return };
-                    let p = person(keys.field(f, 1));
-                    ck[bucket(p, nb)].push(Click { person: p, ts: t, cid: keys.field(f, 0), camp });
-                });
-            }
-        },
-    );
+                        let mut r = Raw {
+                            eid: keys.field(f, 0),
+                            ingest: ts::parse(f.get(3)).unwrap_or(i64::MAX),
+                            uid: 0,
+                            ts: 0,
+                            price: 0,
+                            cat: 0,
+                            kind: 0,
+                            ok: false,
+                        };
+                        let kind = match f.get(4) {
+                            b"view" => Some(0),
+                            b"cart" => Some(1),
+                            b"purchase" => Some(PURCHASE),
+                            _ => None,
+                        };
+                        if let (Some(t), Some(kind)) = (ts::parse(f.get(2)), kind)
+                            && t >= ws
+                            && t < we
+                            && f.len(1) != 0
+                            && f.len(5) != 0
+                            && r.ingest.saturating_sub(t) <= LATE
+                        {
+                            let p = if kind == PURCHASE { price(f.get(6)) } else { Some(0) };
+                            if let Some(p) = p {
+                                r.ok = true;
+                                r.ts = t;
+                                r.kind = kind;
+                                r.price = p;
+                                r.uid = keys.field(f, 1);
+                                r.cat = products.field(f, 5).unwrap_or(unknown);
+                            }
+                        }
+                        ev[bucket(r.eid, nbe)].push(r);
+                    });
+                } else {
+                    let n = clicks.read(i - nev, &mut st.buf);
+                    let Parse { buf, ck, .. } = st;
+                    scan::lines::<4, _>(buf, n, |f| {
+                        if f.len(0) == 0 || f.len(1) == 0 {
+                            return;
+                        }
+                        let Some(t) = ts::parse(f.get(3)) else { return };
+                        if t < ws - REACH || t >= we {
+                            return;
+                        }
+                        let Some(camp) = campaigns.field(f, 2) else { return };
+                        ck.push(Click { person: keys.field(f, 1), ts: t, cid: keys.field(f, 0), camp });
+                    });
+                }
+            },
+        );
+        (people.join().unwrap(), parsed)
+    });
+    let person = |uid: u64| persons.get(uid).unwrap_or(uid);
     lap("parse");
 
-    // ---- 2. dedup on event_id, person lookup, scatter by person ----
+    // ---- 2. dedup on event_id, then person lookup and scatter by person; and the
+    // clicks' person lookup and scatter, in pieces after the event_id buckets ----
+    const PIECE: usize = 1 << 16;
+    let pieces: Vec<(usize, usize)> =
+        parsed.iter().enumerate().flat_map(|(t, p)| (0..p.ck.len()).step_by(PIECE).map(move |s| (t, s))).collect();
+    const AHEAD: usize = 16;
+    let nck: usize = parsed.iter().map(|p| p.ck.len()).sum();
     let (_, deduped) = par::run(
-        nb,
+        nbe + pieces.len(),
         threads,
-        || (0..nb).map(|_| Vec::<Ev>::new()).collect::<Vec<_>>(),
-        |outb, b| {
-            let parts: Vec<&[Raw]> = parsed.iter().map(|p| &p.ev[b][..]).collect();
-            let n: usize = parts.iter().map(|p| p.len()).sum();
+        || Dedup {
+            ev: (0..nb).map(|_| Vec::with_capacity(est / threads / nb * 5 / 4)).collect(),
+            ck: (0..nb).map(|_| Vec::with_capacity(nck / threads / nb * 5 / 4)).collect(),
+            slots: Vec::new(),
+            kept: Vec::new(),
+            ingest: Vec::new(),
+        },
+        |st, b| {
+            if b >= nbe {
+                let (t, s) = pieces[b - nbe];
+                let cs = &parsed[t].ck[s..(s + PIECE).min(parsed[t].ck.len())];
+                for i in 0..cs.len() {
+                    if i + AHEAD < cs.len() {
+                        persons.prefetch(cs[i + AHEAD].person);
+                    }
+                    let mut c = cs[i];
+                    c.person = person(c.person);
+                    st.ck[bucket(c.person, nb)].push(c);
+                }
+                return;
+            }
+            let Dedup { ev: outb, slots, kept, ingest, .. } = st;
+            let n: usize = parsed.iter().map(|p| p.ev[b].len()).sum();
             let cap = (n * 2).next_power_of_two().max(16);
             let shift = 64 - cap.trailing_zeros();
             let mask = cap - 1;
-            // Slot -> (part << 32 | index) of the earliest copy so far.
-            let mut slots = vec![u64::MAX; cap];
-            for (pi, part) in parts.iter().enumerate() {
-                for (ri, r) in part.iter().enumerate() {
-                    let h = (pi as u64) << 32 | ri as u64;
-                    let mut s = (r.eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
-                    loop {
-                        let o = slots[s];
-                        if o == u64::MAX {
-                            slots[s] = h;
-                            break;
-                        }
-                        let q = &parts[(o >> 32) as usize][o as u32 as usize];
-                        if q.eid == r.eid {
-                            if r.ingest < q.ingest {
-                                slots[s] = h;
-                            }
-                            break;
-                        }
-                        s = (s + 1) & mask;
+            // One pass: the first copy of an event_id appends its event to `kept` and
+            // its slot remembers where; an earlier-ingested copy overwrites it in place.
+            // A kept copy that failed validation stays, as NOT_OK, and is dropped below.
+            slots.clear();
+            slots.resize(cap, (u64::MAX, 0));
+            kept.clear();
+            ingest.clear();
+            let ev = |r: &Raw| Ev { person: r.uid, ts: r.ts, price: r.price, cat: r.cat, kind: if r.ok { r.kind } else { NOT_OK } };
+            for r in parsed.iter().flat_map(|p| p.ev[b].iter()) {
+                let mut s = (r.eid.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize;
+                loop {
+                    let (k, i) = slots[s];
+                    if k == u64::MAX {
+                        slots[s] = (r.eid, kept.len() as u32);
+                        kept.push(ev(r));
+                        ingest.push(r.ingest);
+                        break;
                     }
+                    if k == r.eid {
+                        if r.ingest < ingest[i as usize] {
+                            kept[i as usize] = ev(r);
+                            ingest[i as usize] = r.ingest;
+                        }
+                        break;
+                    }
+                    s = (s + 1) & mask;
                 }
             }
-            let mut kept: Vec<Ev> = Vec::with_capacity(n);
-            for &o in &slots {
-                if o != u64::MAX {
-                    let r = &parts[(o >> 32) as usize][o as u32 as usize];
-                    if r.ok {
-                        kept.push(Ev { person: r.uid, ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });
-                    }
-                }
-            }
-            drop(slots);
-            const AHEAD: usize = 16;
+            kept.retain(|e| e.kind != NOT_OK);
             for i in 0..kept.len() {
                 if i + AHEAD < kept.len() {
                     persons.prefetch(kept[i + AHEAD].person);
@@ -420,10 +467,7 @@ fn main() {
             }
         },
     );
-    let mut parsed = parsed;
-    for p in &mut parsed {
-        p.ev = Vec::new();
-    }
+    drop(parsed);
     lap("dedup");
 
     // ---- 3. sessions, credit, assists ----
@@ -435,19 +479,76 @@ fn main() {
         threads,
         || vec![[0u64; 4]; width],
         |camp, b| {
-            let mut ev: Vec<Ev> = Vec::with_capacity(deduped.iter().map(|d| d[b].len()).sum());
+            // Group by person, in no particular person order: number the bucket's people
+            // densely, counting-sort events and clicks by that number straight out of the
+            // parts, then sort each person's own run by time. Clicks of people with no
+            // surviving event credit nothing and are skipped.
+            let n_ev: usize = deduped.iter().map(|d| d.ev[b].len()).sum();
+            let mut ids = Dense::new(n_ev / 16);
+            let mut pid: Vec<u32> = Vec::with_capacity(n_ev);
             for d in &deduped {
-                ev.extend_from_slice(&d[b]);
+                pid.extend(d.ev[b].iter().map(|e| ids.id(e.person)));
             }
-            let mut ck: Vec<Click> = Vec::with_capacity(parsed.iter().map(|p| p.ck[b].len()).sum());
-            for p in &parsed {
-                ck.extend_from_slice(&p.ck[b]);
+            let np = ids.keys.len();
+            let mut eoff = vec![0u32; np + 1];
+            for &x in &pid {
+                eoff[x as usize + 1] += 1;
             }
-            ev.sort_unstable_by_key(|e| (e.person, e.ts));
-            if interned {
-                ck.sort_unstable_by(|x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then_with(|| keys.cmp(x.cid, y.cid)));
-            } else {
-                ck.sort_unstable_by_key(|c| (c.person, c.ts, c.cid));
+            for x in 0..np {
+                eoff[x + 1] += eoff[x];
+            }
+            let mut ev: Vec<Ev> = Vec::with_capacity(n_ev);
+            {
+                let mut at = eoff.clone();
+                let out = ev.spare_capacity_mut();
+                for (e, &x) in deduped.iter().flat_map(|d| d.ev[b].iter()).zip(&pid) {
+                    out[at[x as usize] as usize].write(*e);
+                    at[x as usize] += 1;
+                }
+                // Every slot 0..n_ev was written once: the counts sum to n_ev.
+                unsafe { ev.set_len(n_ev) };
+            }
+            drop(pid);
+            let mut cid_of: Vec<u32> = Vec::with_capacity(deduped.iter().map(|p| p.ck[b].len()).sum());
+            for p in &deduped {
+                cid_of.extend(p.ck[b].iter().map(|c| ids.get(c.person).unwrap_or(u32::MAX)));
+            }
+            let mut coff = vec![0u32; np + 1];
+            for &x in &cid_of {
+                if x != u32::MAX {
+                    coff[x as usize + 1] += 1;
+                }
+            }
+            for x in 0..np {
+                coff[x + 1] += coff[x];
+            }
+            let nck = coff[np] as usize;
+            let mut ck: Vec<Click> = Vec::with_capacity(nck);
+            {
+                let mut at = coff.clone();
+                let out = ck.spare_capacity_mut();
+                for (c, &x) in deduped.iter().flat_map(|p| p.ck[b].iter()).zip(&cid_of) {
+                    if x != u32::MAX {
+                        out[at[x as usize] as usize].write(*c);
+                        at[x as usize] += 1;
+                    }
+                }
+                unsafe { ck.set_len(nck) };
+            }
+            drop(cid_of);
+            for x in 0..np {
+                let es = &mut ev[eoff[x] as usize..eoff[x + 1] as usize];
+                if es.len() > 1 {
+                    es.sort_unstable_by_key(|e| e.ts);
+                }
+                let cl = &mut ck[coff[x] as usize..coff[x + 1] as usize];
+                if cl.len() > 1 {
+                    if interned {
+                        cl.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| keys.cmp(x.cid, y.cid)));
+                    } else {
+                        cl.sort_unstable_by_key(|c| (c.ts, c.cid));
+                    }
+                }
             }
 
             let mut users: Vec<UserRow> = Vec::new();
@@ -471,23 +572,10 @@ fn main() {
                 UserRow { top: best.map_or(NO_TOP, |b| b.1 as u32), ..u }
             };
 
-            let (mut i, mut c) = (0usize, 0usize);
-            while i < ev.len() {
-                let p = ev[i].person;
-                let mut e_end = i + 1;
-                while e_end < ev.len() && ev[e_end].person == p {
-                    e_end += 1;
-                }
-                while c < ck.len() && ck[c].person < p {
-                    c += 1;
-                }
-                let c0 = c;
-                while c < ck.len() && ck[c].person == p {
-                    c += 1;
-                }
-                let cl = &ck[c0..c];
-                let es = &ev[i..e_end];
-                i = e_end;
+            for x in 0..np {
+                let p = ids.keys[x];
+                let es = &ev[eoff[x] as usize..eoff[x + 1] as usize];
+                let cl = &ck[coff[x] as usize..coff[x + 1] as usize];
 
                 starts.clear();
                 sday.clear();
