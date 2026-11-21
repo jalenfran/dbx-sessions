@@ -837,6 +837,9 @@ fn write_outputs(
     }
     cuts.push(rows.len());
     cuts.dedup();
+    // Select widths for the entire table so every part has the same schema.
+    let narrow_counts = rows.iter().flatten().all(|u| u.sessions.max(u.events) <= i32::MAX as u32);
+    let narrow_revenue = rows.iter().flatten().all(|u| u.revenue <= i32::MAX as u64);
     let results = par::map(cuts.len() - 1, threads, |p| {
         let group = &rows[cuts[p]..cuts[p + 1]];
         let n: usize = group.iter().map(|r| r.len()).sum();
@@ -860,9 +863,9 @@ fn write_outputs(
             &[
                 Column { name: "user_id", values: uid },
                 Column { name: "day", values: Values::Date(day) },
-                Column { name: "sessions", values: Values::I64(ses) },
-                Column { name: "events", values: Values::I64(evs) },
-                Column { name: "revenue_cents", values: Values::I64(rev) },
+                Column { name: "sessions", values: Values::integers(ses, narrow_counts) },
+                Column { name: "events", values: Values::integers(evs, narrow_counts) },
+                Column { name: "revenue_cents", values: Values::integers(rev, narrow_revenue) },
                 Column { name: "top_category", values: top },
             ],
         )
@@ -900,16 +903,20 @@ fn write_outputs(
             asst.push(a[3] as i64);
         }
     }
+    let narrow = |v: Vec<i64>| {
+        let fits = v.iter().all(|&x| i32::try_from(x).is_ok());
+        Values::integers(v, fits)
+    };
     parquet::write(
         &cd.join("part-000.parquet"),
         &[
             Column { name: "campaign_id", values: cid },
             Column { name: "channel", values: chan },
             Column { name: "day", values: Values::Date(day) },
-            Column { name: "sessions", values: Values::I64(s) },
-            Column { name: "purchasing_sessions", values: Values::I64(ps) },
-            Column { name: "revenue_cents", values: Values::I64(r) },
-            Column { name: "assisted_sessions", values: Values::I64(asst) },
+            Column { name: "sessions", values: narrow(s) },
+            Column { name: "purchasing_sessions", values: narrow(ps) },
+            Column { name: "revenue_cents", values: narrow(r) },
+            Column { name: "assisted_sessions", values: narrow(asst) },
         ],
     )
 }
